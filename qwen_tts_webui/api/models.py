@@ -128,3 +128,16 @@ class InterruptResponse(BaseModel):
     """中断响应"""
 
     message: str = Field(description="中断消息")
+
+
+class MemoryStatusResponse(BaseModel):
+    """模型与显存状态"""
+
+    loaded: bool = Field(description="TTS 模型是否已加载")
+    model_name: Optional[str] = Field(default=None, description="当前驻留的模型名")
+    cuda_available: bool = Field(description="是否检测到 CUDA")
+    allocated_mb: float = Field(description="PyTorch 已分配显存 (MB)")
+    reserved_mb: float = Field(description="PyTorch 已保留显存 (MB)")
+    free_mb: float = Field(description="当前空闲显存 (MB)")
+    total_mb: float = Field(description="GPU 总显存 (MB)")
+    message: str = Field(default="", description="状态说明")

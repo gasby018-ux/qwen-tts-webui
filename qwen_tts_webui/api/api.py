@@ -136,6 +136,18 @@ class Api:
             methods=["POST"],
             response_model=models.InterruptResponse,
         )
+        self.add_api_route(
+            "/qwenapi/v1/memory",
+            self.get_memory,
+            methods=["GET"],
+            response_model=models.MemoryStatusResponse,
+        )
+        self.add_api_route(
+            "/qwenapi/v1/unload",
+            self.unload_model_api,
+            methods=["POST"],
+            response_model=models.MemoryStatusResponse,
+        )
 
     def add_api_route(
         self,
@@ -420,7 +432,9 @@ class Api:
             models.SpeakersResponse:
                 发言人列表
         """
-        speakers = get_backend().get_supported_speakers() or []
+        # speaker 是 CustomVoice 专属概念, 固定查询 CustomVoice 模型;
+        # 不能跟随 get_backend().model_name, 否则加载 VoiceDesign/Base 后 speakers 会变空
+        speakers = get_backend().get_supported_speakers(QWEN_TTS_CUSTOM_VOICE_MODEL_LIST[0]) or []
         return models.SpeakersResponse(speakers=speakers)
 
     def get_languages(
@@ -432,7 +446,8 @@ class Api:
             models.LanguagesResponse:
                 语言列表
         """
-        languages = get_backend().get_supported_languages() or []
+        model_name = get_backend().model_name or QWEN_TTS_CUSTOM_VOICE_MODEL_LIST[0]
+        languages = get_backend().get_supported_languages(model_name) or []
         return models.LanguagesResponse(languages=languages)
 
     def get_options(
@@ -475,6 +490,33 @@ class Api:
         """
         state.interrupt()
         return models.InterruptResponse(message="任务已中断")
+
+    def get_memory(
+        self,
+    ) -> models.MemoryStatusResponse:
+        """查询 TTS 模型加载状态和 GPU 显存"""
+        status = get_backend().get_memory_status()
+        if status["loaded"]:
+            message = f"模型已驻留: {status['model_name']}"
+        else:
+            message = "当前没有驻留的 TTS 模型"
+        return models.MemoryStatusResponse(**status, message=message)
+
+    def unload_model_api(
+        self,
+    ) -> models.MemoryStatusResponse:
+        """卸载 TTS 模型并回收显存"""
+        with self.queue_lock:
+            backend = get_backend()
+            if backend.model is None:
+                status = backend.get_memory_status()
+                return models.MemoryStatusResponse(**status, message="当前没有驻留的 TTS 模型")
+            backend.unload_model()
+            status = backend.get_memory_status()
+            return models.MemoryStatusResponse(
+                **status,
+                message="已卸载 TTS 模型并回收显存, 可以启动 FlashTalk 等其他 GPU 任务",
+            )
 
     def launch(
         self,

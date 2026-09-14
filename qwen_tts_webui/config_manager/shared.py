@@ -48,7 +48,7 @@ class State:
 
 
 options_templates: dict[str, OptionInfo] = {
-    "api_type": OptionInfo("modelscope", "下载模型的 API 类型"),
+    "api_type": OptionInfo("huggingface", "下载模型的 API 类型"),
     "device_map": OptionInfo("auto", "推理设备"),
     "dtype": OptionInfo("torch.bfloat16", "推理精度"),
     "attn_implementation": OptionInfo(None, "加速方案"),

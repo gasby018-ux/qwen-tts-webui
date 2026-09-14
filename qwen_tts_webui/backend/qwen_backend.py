@@ -18,6 +18,7 @@ from qwen_tts_webui.config_manager.config import (
     LOGGER_LEVEL,
     LOGGER_COLOR,
     OUTPUT_PATH,
+    QWEN_TTS_CUSTOM_VOICE_MODEL_LIST,
 )
 from qwen_tts_webui.logger import get_logger
 from qwen_tts_webui.backend.memory_manager import (
@@ -54,20 +55,70 @@ class QwenTTSBackend:
     def unload_model(
         self,
     ) -> None:
-        """卸载模型"""
-        logger.info("卸载 %s 模型", self.model_name)
-        try:
-            del self.model_name
-        except NameError:
-            pass
-        try:
-            del self.model
-        except NameError:
-            pass
-        cleanup_models()
-        self.model_name = None
+        """卸载模型并回收显存, 便于后续启动 FlashTalk 等其他 GPU 任务"""
+        loaded_name = self.model_name
+        model = self.model
         self.model = None
-        logger.info("卸载模型完成")
+        self.model_name = None
+        if model is None:
+            logger.info("当前没有已加载的 Qwen TTS 模型")
+            cleanup_models()
+            return
+
+        logger.info("卸载 %s 模型", loaded_name)
+        try:
+            if hasattr(model, "to"):
+                model.to("cpu")
+        except Exception:
+            logger.debug("将模型移到 CPU 失败, 继续强制释放", exc_info=True)
+        try:
+            for attr in ("model", "tts_model", "talker", "processor", "tokenizer", "config"):
+                if hasattr(model, attr):
+                    try:
+                        setattr(model, attr, None)
+                    except Exception:
+                        pass
+        except Exception:
+            logger.debug("清理模型内部引用失败", exc_info=True)
+        del model
+        cleanup_models()
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("卸载模型完成, 当前剩余的显存: %.2f MB", get_free_memory() / (1024 * 1024))
+
+    def is_model_loaded(
+        self,
+    ) -> bool:
+        """当前是否有 TTS 模型驻留在内存/显存中"""
+        return self.model is not None
+
+    def get_memory_status(
+        self,
+    ) -> dict[str, Any]:
+        """查询模型加载状态和 GPU 显存占用"""
+        status: dict[str, Any] = {
+            "loaded": self.model is not None,
+            "model_name": self.model_name,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "allocated_mb": 0.0,
+            "reserved_mb": 0.0,
+            "free_mb": 0.0,
+            "total_mb": 0.0,
+        }
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            status["allocated_mb"] = round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
+            status["reserved_mb"] = round(torch.cuda.memory_reserved() / (1024 * 1024), 2)
+            status["free_mb"] = round(free_bytes / (1024 * 1024), 2)
+            status["total_mb"] = round(total_bytes / (1024 * 1024), 2)
+        else:
+            status["free_mb"] = round(get_free_memory() / (1024 * 1024), 2)
+        return status
 
     def load_model(
         self,
@@ -235,23 +286,87 @@ class QwenTTSBackend:
 
     def get_supported_speakers(
         self,
+        model_name: str | None = None,
     ) -> list[str] | None:
         """获取 Qwen TTS 支持的说话者列表
+
+        模型未加载时, 不加载权重, 直接从本地缓存的 config.json 中枚举
+        ``talker_config.spk_id`` 的键, 保证前端页面加载后即可选择发言人。
+
+        Args:
+            model_name (str | None): 目标模型名; 为 None 时使用已加载模型
 
         Returns:
             (list[str] | None): 说话者列表, 如果模型不支持指定任何说话者时则返回 None
         """
-        return self.model.get_supported_speakers()
+        if self.model is not None and (
+            model_name is None or model_name == self.model_name
+        ):
+            return self.model.get_supported_speakers()
+        cfg = self._load_config_metadata(model_name)
+        if cfg is None:
+            return None
+        spk_id = (cfg.get("talker_config") or {}).get("spk_id") or {}
+        if not spk_id:
+            return None
+        return sorted(spk_id.keys())
 
     def get_supported_languages(
         self,
+        model_name: str | None = None,
     ) -> list[str] | None:
         """获取 Qwen TTS 支持的语言列表
+
+        模型未加载时, 不加载权重, 直接从本地缓存的 config.json 中枚举
+        ``talker_config.codec_language_id`` 的键, 保证前端页面加载后即可选择语言。
+
+        Args:
+            model_name (str | None): 目标模型名; 为 None 时使用已加载模型
 
         Returns:
             (list[str] | None): 语言列表, 如果模型不支持指定任何语言时则返回 None
         """
-        return self.model.get_supported_languages()
+        if self.model is not None and (
+            model_name is None or model_name == self.model_name
+        ):
+            return self.model.get_supported_languages()
+        cfg = self._load_config_metadata(model_name)
+        if cfg is None:
+            return None
+        lang_ids = (cfg.get("talker_config") or {}).get("codec_language_id") or {}
+        languages = ["auto"] + [k for k in lang_ids if "dialect" not in k]
+        if len(languages) <= 1:
+            return None
+        return languages
+
+    def _load_config_metadata(
+        self,
+        model_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """不加载模型权重, 仅从本地缓存读取模型 config.json
+
+        Args:
+            model_name (str | None): 目标模型名; 为 None 时使用已加载模型的名称
+
+        Returns:
+            (dict[str, Any] | None): 模型配置字典, 读取失败时返回 None
+        """
+        name = model_name or self.model_name or QWEN_TTS_CUSTOM_VOICE_MODEL_LIST[0]
+        if not name:
+            return None
+        try:
+            import json
+
+            from huggingface_hub import hf_hub_download
+
+            cfg_path = hf_hub_download(
+                repo_id=name,
+                filename="config.json",
+                local_files_only=True,
+            )
+            return json.loads(Path(cfg_path).read_text())
+        except Exception:  # noqa: BLE001
+            return None
 
     def count_tokens(
         self,
